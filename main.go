@@ -18,6 +18,7 @@ import (
 
 const (
 	maxSourceBytes = 64 * 1024
+	maxInputBytes  = 64 * 1024
 	maxOutputBytes = 64 * 1024
 	// runTimeout is the per-request wall-clock budget for a warm-cache
 	// compile+run. 10s gives headroom on smaller/CPU-constrained
@@ -30,7 +31,8 @@ const (
 )
 
 type runRequest struct {
-	Code string `json:"code"`
+	Code  string `json:"code"`
+	Stdin string `json:"stdin"`
 }
 
 type runResponse struct {
@@ -61,7 +63,7 @@ func main() {
 	// the whole fmt/os/reflect dependency graph, which can blow past the
 	// per-request timeout. Pay that cost once at boot instead.
 	log.Print("warming go build cache...")
-	warmup := executeWithTimeout("package main\nimport (\"fmt\"; \"os\"; \"strings\"; \"time\")\nfunc main(){fmt.Println(strings.ToUpper(\"warm\"), time.Now().Year(), os.Getpid())}\n", warmupTimeout)
+	warmup := executeWithTimeout("package main\nimport (\"fmt\"; \"os\"; \"strings\"; \"time\")\nfunc main(){fmt.Println(strings.ToUpper(\"warm\"), time.Now().Year(), os.Getpid())}\n", "", warmupTimeout)
 	if !warmup.OK {
 		log.Printf("cache warmup did not complete cleanly: %s", warmup.Stderr)
 	} else {
@@ -96,7 +98,7 @@ func handleRun(w http.ResponseWriter, r *http.Request, token string) {
 	}
 
 	var req runRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSourceBytes+1024)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSourceBytes+maxInputBytes+1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -108,17 +110,21 @@ func handleRun(w http.ResponseWriter, r *http.Request, token string) {
 		http.Error(w, "code exceeds max size", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if len(req.Stdin) > maxInputBytes {
+		http.Error(w, "stdin exceeds max size", http.StatusRequestEntityTooLarge)
+		return
+	}
 
-	resp := execute(req.Code)
+	resp := execute(req.Code, req.Stdin)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-func execute(code string) runResponse {
-	return executeWithTimeout(code, runTimeout)
+func execute(code, stdin string) runResponse {
+	return executeWithTimeout(code, stdin, runTimeout)
 }
 
-func executeWithTimeout(code string, timeout time.Duration) runResponse {
+func executeWithTimeout(code, stdin string, timeout time.Duration) runResponse {
 	workDir, err := os.MkdirTemp("", "golearn-run-*")
 	if err != nil {
 		return runResponse{OK: false, Stderr: "internal error: failed to create sandbox"}
@@ -181,6 +187,7 @@ func executeWithTimeout(code string, timeout time.Duration) runResponse {
 	stderr.limit = maxOutputBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	cmd.Stdin = strings.NewReader(stdin)
 
 	start := time.Now()
 	runErr := cmd.Run()
