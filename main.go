@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,7 +19,14 @@ import (
 const (
 	maxSourceBytes = 64 * 1024
 	maxOutputBytes = 64 * 1024
-	runTimeout     = 5 * time.Second
+	// runTimeout is the per-request wall-clock budget for a warm-cache
+	// compile+run. 10s gives headroom on smaller/CPU-constrained
+	// containers where even a cached compile is slower than on a dev box.
+	runTimeout = 10 * time.Second
+	// warmupTimeout is deliberately generous: the very first compile after
+	// boot builds the whole stdlib dependency graph from a cold cache,
+	// which can take far longer than a normal run on a small container.
+	warmupTimeout = 120 * time.Second
 )
 
 type runRequest struct {
@@ -53,7 +61,7 @@ func main() {
 	// the whole fmt/os/reflect dependency graph, which can blow past the
 	// per-request timeout. Pay that cost once at boot instead.
 	log.Print("warming go build cache...")
-	warmup := execute("package main\nimport (\"fmt\"; \"os\"; \"strings\"; \"time\")\nfunc main(){fmt.Println(strings.ToUpper(\"warm\"), time.Now().Year(), os.Getpid())}\n")
+	warmup := executeWithTimeout("package main\nimport (\"fmt\"; \"os\"; \"strings\"; \"time\")\nfunc main(){fmt.Println(strings.ToUpper(\"warm\"), time.Now().Year(), os.Getpid())}\n", warmupTimeout)
 	if !warmup.OK {
 		log.Printf("cache warmup did not complete cleanly: %s", warmup.Stderr)
 	} else {
@@ -107,6 +115,10 @@ func handleRun(w http.ResponseWriter, r *http.Request, token string) {
 }
 
 func execute(code string) runResponse {
+	return executeWithTimeout(code, runTimeout)
+}
+
+func executeWithTimeout(code string, timeout time.Duration) runResponse {
 	workDir, err := os.MkdirTemp("", "golearn-run-*")
 	if err != nil {
 		return runResponse{OK: false, Stderr: "internal error: failed to create sandbox"}
@@ -121,7 +133,7 @@ func execute(code string) runResponse {
 		return runResponse{OK: false, Stderr: "internal error: failed to init module"}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// We deliberately avoid shell-level ulimits here: -v (RLIMIT_AS) kills
@@ -178,7 +190,7 @@ func execute(code string) runResponse {
 		return runResponse{
 			OK:         false,
 			Stdout:     stdout.String(),
-			Stderr:     stderr.String() + "\n[timed out after 5s]",
+			Stderr:     stderr.String() + fmt.Sprintf("\n[timed out after %s]", timeout),
 			ExitCode:   -1,
 			DurationMs: duration.Milliseconds(),
 		}
