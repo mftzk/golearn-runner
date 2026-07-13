@@ -32,6 +32,78 @@ func TestHandleRunPassesStdinToProgram(t *testing.T) {
 	}
 }
 
+func TestHandleRunExecutesWorkspaceFiles(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"files": map[string]string{
+			"main.go": `package main
+import "fmt"
+func main(){fmt.Println(message())}`,
+			"message.go": `package main
+func message() string { return "workspace works" }`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(string(payload)))
+	request.Header.Set("X-Runner-Token", "test-token")
+	recorder := httptest.NewRecorder()
+
+	handleRun(recorder, request, "test-token")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response runResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Stdout != "workspace works\n" {
+		t.Fatalf("expected workspace program to run, got ok=%v stdout=%q stderr=%q", response.OK, response.Stdout, response.Stderr)
+	}
+}
+
+func TestHandleRunRejectsUnsafeWorkspacePath(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"files": map[string]string{
+			"main.go":    "package main\nfunc main(){}",
+			"../evil.go": "package main\nfunc nope(){}",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(string(payload)))
+	request.Header.Set("X-Runner-Token", "test-token")
+	recorder := httptest.NewRecorder()
+
+	handleRun(recorder, request, "test-token")
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", recorder.Code)
+	}
+}
+
+func TestHandleRunRejectsOversizedWorkspace(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"files": map[string]string{
+			"main.go": strings.Repeat("x", maxSourceBytes+1),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(string(payload)))
+	request.Header.Set("X-Runner-Token", "test-token")
+	recorder := httptest.NewRecorder()
+
+	handleRun(recorder, request, "test-token")
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", recorder.Code)
+	}
+}
+
 func TestHandleRunRejectsOversizedStdin(t *testing.T) {
 	requestBody := `{"code":"package main\nfunc main(){}","stdin":"` + strings.Repeat("x", maxInputBytes+1) + `"}`
 	request := httptest.NewRequest(http.MethodPost, "/run", strings.NewReader(requestBody))

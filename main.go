@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,9 +18,12 @@ import (
 )
 
 const (
-	maxSourceBytes = 64 * 1024
-	maxInputBytes  = 64 * 1024
-	maxOutputBytes = 64 * 1024
+	maxSourceBytes    = 64 * 1024
+	maxInputBytes     = 64 * 1024
+	maxOutputBytes    = 64 * 1024
+	maxWorkspaceFiles = 8
+	maxFileNameBytes  = 128
+	maxRequestBytes   = (2 * maxSourceBytes) + maxInputBytes + (16 * 1024)
 	// runTimeout is the per-request wall-clock budget for a warm-cache
 	// compile+run. 10s gives headroom on smaller/CPU-constrained
 	// containers where even a cached compile is slower than on a dev box.
@@ -31,8 +35,9 @@ const (
 )
 
 type runRequest struct {
-	Code  string `json:"code"`
-	Stdin string `json:"stdin"`
+	Code  string            `json:"code"`
+	Files map[string]string `json:"files"`
+	Stdin string            `json:"stdin"`
 }
 
 type runResponse struct {
@@ -63,7 +68,7 @@ func main() {
 	// the whole fmt/os/reflect dependency graph, which can blow past the
 	// per-request timeout. Pay that cost once at boot instead.
 	log.Print("warming go build cache...")
-	warmup := executeWithTimeout("package main\nimport (\"fmt\"; \"os\"; \"strings\"; \"time\")\nfunc main(){fmt.Println(strings.ToUpper(\"warm\"), time.Now().Year(), os.Getpid())}\n", "", warmupTimeout)
+	warmup := executeWithTimeout("package main\nimport (\"fmt\"; \"os\"; \"strings\"; \"time\")\nfunc main(){fmt.Println(strings.ToUpper(\"warm\"), time.Now().Year(), os.Getpid())}\n", nil, "", warmupTimeout)
 	if !warmup.OK {
 		log.Printf("cache warmup did not complete cleanly: %s", warmup.Stderr)
 	} else {
@@ -98,41 +103,87 @@ func handleRun(w http.ResponseWriter, r *http.Request, token string) {
 	}
 
 	var req runRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSourceBytes+maxInputBytes+1024)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if len(req.Code) == 0 {
-		http.Error(w, "code is required", http.StatusBadRequest)
+	if (req.Code == "") == (len(req.Files) == 0) {
+		http.Error(w, "exactly one of code or files is required", http.StatusBadRequest)
 		return
 	}
 	if len(req.Code) > maxSourceBytes {
 		http.Error(w, "code exceeds max size", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if len(req.Files) > 0 {
+		if err := validateWorkspaceFiles(req.Files); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	if len(req.Stdin) > maxInputBytes {
 		http.Error(w, "stdin exceeds max size", http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	resp := execute(req.Code, req.Stdin)
+	resp := execute(req.Code, req.Files, req.Stdin)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-func execute(code, stdin string) runResponse {
-	return executeWithTimeout(code, stdin, runTimeout)
+func validateWorkspaceFiles(files map[string]string) error {
+	if len(files) == 0 {
+		return fmt.Errorf("workspace files are required")
+	}
+	if len(files) > maxWorkspaceFiles {
+		return fmt.Errorf("too many workspace files")
+	}
+
+	totalBytes := 0
+	for name, content := range files {
+		if name == "" || len(name) > maxFileNameBytes {
+			return fmt.Errorf("invalid workspace file name")
+		}
+		if filepath.IsAbs(name) || filepath.Clean(name) != name || filepath.Base(name) != name || strings.Contains(name, `\`) {
+			return fmt.Errorf("invalid workspace file path")
+		}
+		if filepath.Ext(name) != ".go" {
+			return fmt.Errorf("workspace files must be .go files")
+		}
+		totalBytes += len(content)
+		if totalBytes > maxSourceBytes {
+			return fmt.Errorf("workspace source exceeds max size")
+		}
+	}
+	return nil
 }
 
-func executeWithTimeout(code, stdin string, timeout time.Duration) runResponse {
+func execute(code string, files map[string]string, stdin string) runResponse {
+	return executeWithTimeout(code, files, stdin, runTimeout)
+}
+
+func executeWithTimeout(code string, files map[string]string, stdin string, timeout time.Duration) runResponse {
 	workDir, err := os.MkdirTemp("", "golearn-run-*")
 	if err != nil {
 		return runResponse{OK: false, Stderr: "internal error: failed to create sandbox"}
 	}
 	defer os.RemoveAll(workDir)
 
-	if err := os.WriteFile(filepath.Join(workDir, "main.go"), []byte(code), 0o600); err != nil {
-		return runResponse{OK: false, Stderr: "internal error: failed to write source"}
+	if files == nil {
+		if err := os.WriteFile(filepath.Join(workDir, "main.go"), []byte(code), 0o600); err != nil {
+			return runResponse{OK: false, Stderr: "internal error: failed to write source"}
+		}
+	} else {
+		names := make([]string, 0, len(files))
+		for name := range files {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if err := os.WriteFile(filepath.Join(workDir, name), []byte(files[name]), 0o600); err != nil {
+				return runResponse{OK: false, Stderr: "internal error: failed to write source"}
+			}
+		}
 	}
 	goModContent := "module sandbox\n\ngo 1.22\n"
 	if err := os.WriteFile(filepath.Join(workDir, "go.mod"), []byte(goModContent), 0o600); err != nil {
